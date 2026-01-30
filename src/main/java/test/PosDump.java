@@ -163,6 +163,13 @@ private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxPa
     // NEW: track max scene score inside current paragraph (only used when curKind==SCENE)
     int curSceneScoreMax = 0;
 
+float curParaMinX = -1f; // NEW: indent baseline for current paragraph
+
+    float curMinXMin = Float.MAX_VALUE;
+    float curFontAvg = 0f;
+    int curFontCount = 0;
+
+
     for (Line ln : lines) {
         String t = normalize(ln.text.toString());
         if (t.isBlank()) continue;
@@ -185,6 +192,11 @@ private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxPa
         else if (isParenthetical(t)) lineKind = Kind.PAREN;
         else if (dialogueMode) lineKind = Kind.DIALOGUE;
         else lineKind = Kind.ACTION;
+//Temp debug:
+        if (t.contains("HIRT")) {
+    System.out.println("DBG HIRT t=[" + t + "] isScene=" + isSceneHeading(t)
+        + " isChar=" + isCharacterCue(t));
+}
 
         boolean newPara;
 
@@ -204,13 +216,25 @@ private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxPa
         if (!newPara && curKind != null && curKind != lineKind) {
             newPara = true;
         }
+// NEW: if we're staying in ACTION/DIALOGUE but indent jumps, split paragraph.
+// (this is the core test you want)
+if (!newPara && curKind != null && curKind == lineKind) {
+    if (lineKind == Kind.ACTION || lineKind == Kind.DIALOGUE) {
+        if (curParaMinX >= 0 && Math.abs(ln.minX - curParaMinX) >= 35f) { // tune later
+            newPara = true;
+        }
+    }
+}
 
         if (newPara) {
             if (cur.length() > 0) {
+//                Kind k = (curKind == null ? Kind.ACTION : curKind);
+//                String header = (k == Kind.SCENE)
+//                        ? ("SCENE_S" + curSceneScoreMax)
+//                        : k.toString();
                 Kind k = (curKind == null ? Kind.ACTION : curKind);
-                String header = (k == Kind.SCENE)
-                        ? ("SCENE_S" + curSceneScoreMax)
-                        : k.toString();
+                float paraFont = (curFontCount > 0) ? (curFontAvg / curFontCount) : 0f;
+                String header = paraHeader(k, curSceneScoreMax, curMinXMin, paraFont);
 
                 paras.add(header + "\n" + cur.toString().trim());
                 if (paras.size() >= maxParas) break;
@@ -218,15 +242,28 @@ private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxPa
             }
 
             curKind = lineKind;
+            curMinXMin = ln.minX;
+            curFontAvg = ln.avgFontSize();
+            curFontCount = 1;
 
             // NEW: reset scene max for the new paragraph
             curSceneScoreMax = (lineKind == Kind.SCENE) ? sc.score : 0;
+
+            curParaMinX = ln.minX; // NEW
+
         } else {
             cur.append("\n");
         }
 
         cur.append(t);
         prev = ln;
+
+
+        curMinXMin = Math.min(curMinXMin, ln.minX);
+        curFontAvg += ln.avgFontSize();
+        curFontCount++;
+        //For latear usage:
+        //float paraFont = (curFontCount > 0) ? (curFontAvg / curFontCount) : 0f;
 
         // NEW: update max score while building a SCENE paragraph
         if (curKind == Kind.SCENE) {
@@ -239,10 +276,14 @@ private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxPa
     }
 
     if (paras.size() < maxParas && cur.length() > 0) {
+//        Kind k = (curKind == null ? Kind.ACTION : curKind);
+//        String header = (k == Kind.SCENE)
+//                ? ("SCENE_S" + curSceneScoreMax)
+//               : k.toString();
         Kind k = (curKind == null ? Kind.ACTION : curKind);
-        String header = (k == Kind.SCENE)
-                ? ("SCENE_S" + curSceneScoreMax)
-                : k.toString();
+        float paraFont = (curFontCount > 0) ? (curFontAvg / curFontCount) : 0f;
+        String header = paraHeader(k, curSceneScoreMax, curMinXMin, paraFont);
+
 
         paras.add(header + "\n" + cur.toString().trim());
     }
@@ -331,20 +372,32 @@ static boolean isSceneHeading(String s) {
     // Accept '?' because of encoding issues
     return t.matches("^\\d+\\s*\\S.*") && t.equals(t.toUpperCase());
 }
-
 static boolean isCharacterCue(String s) {
     String t = s.trim();
-    if (t.length() < 2 || t.length() > 25) return false;
+    if (t.length() < 2 || t.length() > 30) return false;
+
+    // Strip optional numeric prefix like "1.HIRT", "2) HIRT", "3 - HIRT"
+    String cue = t.replaceFirst("^\\s*\\d+\\s*[\\.)\\-]?\\s*", "").trim();
+    if (cue.isEmpty()) return false;
+
+    // If the remaining cue is a clean uppercase name, ACCEPT it immediately.
+    // This prevents "1.HIRT" being killed by isSceneHeading().
+    if (cue.matches("^[A-ZÇĞİÖŞÜ\\?\\- ]+$")) {
+        long letters = cue.chars().filter(Character::isLetter).count();
+        if (letters >= 2) return true;
+    }
+
+    // Other rejections (keep)
+    if (t.contains("/")) return false;
+
+    // Only now apply the scene veto for other cases
     if (isSceneHeading(t)) return false;
-    if (t.contains("/") || t.contains(".")) return false;
 
-    // allow Turkish letters + '?' + spaces + parens + dash
-    if (!t.matches("^[A-ZÇĞİÖŞÜ\\? \\-\\(\\)]+$")) return false;
-
-    // must have at least 2 letters (ignore '?')
-    long letters = t.chars().filter(ch -> Character.isLetter(ch)).count();
-    return letters >= 2;
+    return false;
 }
+
+
+
 
 static boolean isParenthetical(String s) {
     String t = s.trim();
@@ -418,5 +471,31 @@ static String sceneFlags(SceneScore sc) {
             + "B" + Math.min(sc.blockCount, 9)
             + "C" + (sc.mostlyCaps ? "1" : "0");
 }
+
+static String paraHeader(Kind k, int sceneScoreMax, float minX, float fontPt) {
+    String x = "x" + bucket10(minX);
+    String f = "f" + bucketFont(fontPt);
+
+    if (k == Kind.SCENE) {
+        return "SCENE_S" + sceneScoreMax + "_" + x + "_" + f;
+    }
+    return k.name() + "_" + x + "_" + f;
+}
+
+static int bucket10(float v) {
+    // 76 -> 80, 108 -> 110 (matches your earlier debug vibe)
+    return Math.round(v / 10f) * 10;
+}
+
+static int bucketFont(float pt) {
+    // 11.7 -> 12, 9.6 -> 10
+    return Math.round(pt);
+}
+static boolean isTempBypassHirtCue(String t) {
+    // Matches: "1.HIRT", "2.HIRT", "1. HIRT", "12.HIRT" (case-insensitive)
+    String s = t.trim().toUpperCase(Locale.ROOT);
+    return s.matches("^\\d{1,3}\\s*\\.\\s*HIRT$");
+}
+
 
 }
