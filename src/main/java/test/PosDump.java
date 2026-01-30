@@ -1,0 +1,422 @@
+package test;
+
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.text.TextPosition;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+
+public class PosDump {
+
+    // One "glyph" with position
+static class G {
+    final int page;
+    final float x;
+    final float y;
+    final float w;
+    final float fontSize;
+    final String ch;
+    final int yKey;
+
+    G(int page, float x, float y, float w, float fontSize, String ch) {
+        this.page = page;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.fontSize = fontSize;
+        this.ch = ch;
+        this.yKey = Math.round(y * 2); // 0.5pt bucket (change 2->1 for 1pt)
+    }
+}
+
+
+    // One reconstructed line
+    static class Line {
+        final int page;
+        final int yKey;
+        final float y; // keep original for gap calcs if you want
+        float minX = Float.MAX_VALUE;
+        float maxX = 0;
+        float avgFont = 0;
+        int fontCount = 0;
+        final StringBuilder text = new StringBuilder();
+
+        Line(int page, int yKey, float y) {
+            this.page = page;
+            this.yKey = yKey;
+            this.y = y;
+        }
+
+        void addGlyph(G g) {
+            minX = Math.min(minX, g.x);
+            maxX = Math.max(maxX, g.x + g.w);
+            avgFont += g.fontSize;
+            fontCount++;
+            text.append(g.ch);
+        }
+
+        float avgFontSize() {
+            return fontCount == 0 ? 0 : (avgFont / fontCount);
+        }
+    }
+
+    // Custom stripper that captures TextPositions
+    static class CaptureStripper extends PDFTextStripper {
+        final List<G> glyphs = new ArrayList<>();
+
+        CaptureStripper() throws IOException {
+            super();
+            setSortByPosition(true);
+        }
+
+        @Override
+        protected void writeString(String string, List<TextPosition> textPositions) throws IOException {
+            int page = getCurrentPageNo();
+            for (TextPosition tp : textPositions) {
+                String u = tp.getUnicode();
+                if (u == null || u.isEmpty()) continue;
+
+                // Ignore pure control chars
+                if (u.equals("\r") || u.equals("\n")) continue;
+
+                glyphs.add(new G(
+                        page,
+                        tp.getXDirAdj(),
+                        tp.getYDirAdj(),
+                        tp.getWidthDirAdj(),
+                        tp.getFontSizeInPt(),
+                        u
+                ));
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        String pdfPath   = args.length > 0 ? args[0] : "input.pdf";
+        int startPage    = args.length > 1 ? Integer.parseInt(args[1]) : 1;   // 1-based
+        int maxPages     = args.length > 2 ? Integer.parseInt(args[2]) : 5;
+        int maxParas     = args.length > 3 ? Integer.parseInt(args[3]) : 200;
+
+        try (PDDocument doc = Loader.loadPDF(new File(pdfPath))) {
+            int total = doc.getNumberOfPages();
+            int start = Math.max(1, Math.min(startPage, total));
+            int end   = Math.min(total, start + maxPages - 1);
+
+            CaptureStripper stripper = new CaptureStripper();
+            stripper.setStartPage(start);
+            stripper.setEndPage(end);
+
+            stripper.getText(doc);
+
+            List<Line> lines = buildLines(stripper.glyphs);
+            List<String> paras = groupLinesIntoParagraphs(lines, maxParas);
+
+for (int i = 0; i < paras.size(); i++) {
+    String[] parts = paras.get(i).split("\n", 2);
+    String kind = parts[0];
+    String body = parts.length > 1 ? parts[1] : "";
+    System.out.printf("PARA_%d [%s]%n%s%n%n", i, kind, body);
+}
+
+        }
+
+}
+static String kindLabel(Kind k, SceneScore sc) {
+    if (k != Kind.SCENE) return k.name();
+
+    // purely for logging / grouping visibility
+    // SCENE_1 = strong; SCENE_2 = weaker
+    int tier = (sc != null && sc.score >= 7) ? 1 : 2;
+    return "SCENE_" + tier;
+}
+
+private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxParas) {
+
+    // sort reading order: page asc, y asc (top -> bottom in your current coordinate system)
+    lines.sort(Comparator
+            .comparingInt((Line l) -> l.page)
+            .thenComparing((Line l) -> l.y)
+            .thenComparing(l -> l.minX)); // helps stabilize order within same Y
+
+    // estimate baseline line gap using median gap (next - prev)
+    List<Float> gaps = new ArrayList<>();
+    for (int i = 1; i < lines.size(); i++) {
+        Line a = lines.get(i - 1);
+        Line b = lines.get(i);
+        if (a.page != b.page) continue;
+        gaps.add(b.y - a.y);
+    }
+    float baseline = median(gaps, 13f);
+    float paraBreakGap = baseline * 1.6f;
+
+    List<String> paras = new ArrayList<>();
+    StringBuilder cur = new StringBuilder();
+    Line prev = null;
+
+    // --- kind-aware state ---
+    Kind curKind = null;
+    boolean dialogueMode = false;
+
+    // NEW: track max scene score inside current paragraph (only used when curKind==SCENE)
+    int curSceneScoreMax = 0;
+
+    for (Line ln : lines) {
+        String t = normalize(ln.text.toString());
+        if (t.isBlank()) continue;
+        if (t.equalsIgnoreCase("Created using Celtx")) continue;
+
+        // IMPORTANT: fix underscore + spaced-letter artifacts early
+        t = cleanupWeirdInterleaving(t);
+        if (t.isBlank()) continue;
+
+        // --- scene scorer (non-destructive) ---
+        SceneScore sc = sceneScore(t);
+
+        boolean sceneIndentLikely = ln.minX <= 90f; // tune later
+        boolean isStrongScene = sc.score >= 6 && sceneIndentLikely;
+
+        // classify (KEEP ORDER: SCENE first)
+        Kind lineKind;
+        if (isStrongScene) lineKind = Kind.SCENE;
+        else if (isCharacterCue(t)) lineKind = Kind.CHARACTER;
+        else if (isParenthetical(t)) lineKind = Kind.PAREN;
+        else if (dialogueMode) lineKind = Kind.DIALOGUE;
+        else lineKind = Kind.ACTION;
+
+        boolean newPara;
+
+        if (prev == null) newPara = true;
+        else if (ln.page != prev.page) newPara = true;
+        else {
+            float gap = ln.y - prev.y;
+            newPara = gap >= paraBreakGap;
+        }
+
+        // force boundaries for these
+        if (lineKind == Kind.SCENE || lineKind == Kind.CHARACTER || lineKind == Kind.PAREN) {
+            newPara = true;
+        }
+
+        // kind change breaks paragraph
+        if (!newPara && curKind != null && curKind != lineKind) {
+            newPara = true;
+        }
+
+        if (newPara) {
+            if (cur.length() > 0) {
+                Kind k = (curKind == null ? Kind.ACTION : curKind);
+                String header = (k == Kind.SCENE)
+                        ? ("SCENE_S" + curSceneScoreMax)
+                        : k.toString();
+
+                paras.add(header + "\n" + cur.toString().trim());
+                if (paras.size() >= maxParas) break;
+                cur.setLength(0);
+            }
+
+            curKind = lineKind;
+
+            // NEW: reset scene max for the new paragraph
+            curSceneScoreMax = (lineKind == Kind.SCENE) ? sc.score : 0;
+        } else {
+            cur.append("\n");
+        }
+
+        cur.append(t);
+        prev = ln;
+
+        // NEW: update max score while building a SCENE paragraph
+        if (curKind == Kind.SCENE) {
+            curSceneScoreMax = Math.max(curSceneScoreMax, sc.score);
+        }
+
+        // update mode
+        if (lineKind == Kind.CHARACTER) dialogueMode = true;
+        else if (lineKind == Kind.SCENE) dialogueMode = false;
+    }
+
+    if (paras.size() < maxParas && cur.length() > 0) {
+        Kind k = (curKind == null ? Kind.ACTION : curKind);
+        String header = (k == Kind.SCENE)
+                ? ("SCENE_S" + curSceneScoreMax)
+                : k.toString();
+
+        paras.add(header + "\n" + cur.toString().trim());
+    }
+
+    return paras;
+}
+
+
+static String cleanupWeirdInterleaving(String s) {
+    if (s == null || s.isEmpty()) return s;
+
+    // A) underscore-heavy text => remove underscores between letters, replace rest with spaces
+    int underscoreCount = (int) s.chars().filter(ch -> ch == '_').count();
+    if (underscoreCount > 0 && underscoreCount >= Math.max(2, s.length() / 5)) {
+        // remove underscores between letters
+        s = s.replaceAll("(?<=\\p{L})_(?=\\p{L})", "");
+        s = s.replace('_', ' ');
+    }
+
+    // B) spaced letters like "s ? r a d a" (or "S A T S U M A")
+    // If most tokens are 1 char, join them back.
+    String[] toks = s.trim().split("\\s+");
+    if (toks.length >= 8) {
+        int oneChar = 0;
+        for (String t : toks) if (t.length() == 1) oneChar++;
+        if (oneChar >= (int)(toks.length * 0.70)) {
+            StringBuilder sb = new StringBuilder();
+            for (String t : toks) sb.append(t);
+            s = sb.toString();
+        }
+    }
+
+    return s;
+}
+
+private static String guessType(String paragraphText) {
+    // VERY rough starter: classify scene headings vs action by pattern
+    String firstLine = paragraphText.split("\n", 2)[0].trim();
+
+    // Your observed scene headings: "7KIRIK ...", "2BIR ...", etc.
+    if (firstLine.matches("^\\d+\\s*\\S+.*") && firstLine.equals(firstLine.toUpperCase())) {
+        return "SceneHeading?";
+    }
+    return "Action?";
+}
+
+private static float median(List<Float> xs, float fallback) {
+    if (xs == null || xs.isEmpty()) return fallback;
+    List<Float> s = new ArrayList<>(xs);
+    s.sort(Float::compare);
+    int mid = s.size() / 2;
+    return s.size() % 2 == 0 ? (s.get(mid - 1) + s.get(mid)) / 2f : s.get(mid);
+}
+
+private static List<Line> buildLines(List<G> glyphs) {
+    glyphs.sort(Comparator
+            .comparingInt((G g) -> g.page)
+            .thenComparingInt((G g) -> g.yKey)
+            .thenComparingDouble(g -> g.x));
+
+    List<Line> lines = new ArrayList<>();
+    Line cur = null;
+
+    for (G g : glyphs) {
+        if (cur == null || cur.page != g.page || cur.yKey != g.yKey) {
+            cur = new Line(g.page, g.yKey, g.y);
+            lines.add(cur);
+        }
+        cur.addGlyph(g);
+    }
+    return lines;
+}
+
+
+private static String normalize(String s) {
+    s = s.replace("\u00A0", " ");
+    s = s.replaceAll("[\\t]+", " ");
+    s = s.replaceAll("[ ]{2,}", " ");
+    return s.replaceAll("\\s+$", ""); // only trim end
+}
+enum Kind { SCENE, CHARACTER, PAREN, DIALOGUE, ACTION }
+
+static boolean isSceneHeading(String s) {
+    String t = s.trim();
+    // your headings like "7KIRIK ...", "3?ERMIN EV. IÇ. GECE"
+    // Accept '?' because of encoding issues
+    return t.matches("^\\d+\\s*\\S.*") && t.equals(t.toUpperCase());
+}
+
+static boolean isCharacterCue(String s) {
+    String t = s.trim();
+    if (t.length() < 2 || t.length() > 25) return false;
+    if (isSceneHeading(t)) return false;
+    if (t.contains("/") || t.contains(".")) return false;
+
+    // allow Turkish letters + '?' + spaces + parens + dash
+    if (!t.matches("^[A-ZÇĞİÖŞÜ\\? \\-\\(\\)]+$")) return false;
+
+    // must have at least 2 letters (ignore '?')
+    long letters = t.chars().filter(ch -> Character.isLetter(ch)).count();
+    return letters >= 2;
+}
+
+static boolean isParenthetical(String s) {
+    String t = s.trim();
+    return t.startsWith("(");
+}
+static class SceneScore {
+    final int score;
+    final boolean hasSceneNumber;
+    final int sepCount;
+    final int blockCount;
+    final boolean mostlyCaps;
+    SceneScore(int score, boolean hasSceneNumber, int sepCount, int blockCount, boolean mostlyCaps) {
+        this.score = score;
+        this.hasSceneNumber = hasSceneNumber;
+        this.sepCount = sepCount;
+        this.blockCount = blockCount;
+        this.mostlyCaps = mostlyCaps;
+    }
+}
+
+// separators we treat as “scene separators” (tune later)
+static final String SCN_SEPS = "./\\-–—|,";
+
+static SceneScore sceneScore(String s) {
+    String t = s.trim();
+    if (t.isEmpty()) return new SceneScore(0, false, 0, 0, false);
+
+    // has leading scene number (e.g., "7KHT..." or "7 KHT...")
+    boolean hasNum = t.matches("^\\d{1,4}.*");
+
+    // count separator-ish chars (., /, etc.)
+    int sepCount = 0;
+    for (int i = 0; i < t.length(); i++) {
+        if (SCN_SEPS.indexOf(t.charAt(i)) >= 0) sepCount++;
+    }
+
+    // block count heuristic: split by separators and spaces, count non-empty “chunks”
+    String tmp = t;
+    for (int i = 0; i < SCN_SEPS.length(); i++) tmp = tmp.replace(SCN_SEPS.charAt(i), ' ');
+    String[] chunks = tmp.trim().split("\\s+");
+    int blockCount = 0;
+    for (String c : chunks) if (!c.isEmpty()) blockCount++;
+
+    // “mostly caps” (supports Turkish letters). We don’t require ALL CAPS.
+    int letters = 0, upperLetters = 0;
+    for (int i = 0; i < t.length(); i++) {
+        char ch = t.charAt(i);
+        if (Character.isLetter(ch)) {
+            letters++;
+            if (Character.toUpperCase(ch) == ch) upperLetters++;
+        }
+    }
+    boolean mostlyCaps = letters >= 2 && (upperLetters / (double) letters) >= 0.90;
+
+    // scoring (tune later)
+    int score = 0;
+    if (hasNum) score += 3;
+    if (mostlyCaps) score += 2;
+    if (sepCount >= 2) score += 2;      // "INT./EXT." etc
+    else if (sepCount == 1) score += 1;
+
+    if (blockCount >= 3) score += 1;    // “KHT MUTFAK IÇ GÜN” becomes 4 blocks
+
+    return new SceneScore(score, hasNum, sepCount, blockCount, mostlyCaps);
+}
+
+static String sceneFlags(SceneScore sc) {
+    // compact flags for your style key
+    return "SCN" + (sc.hasSceneNumber ? "1" : "0")
+            + "S" + Math.min(sc.sepCount, 9)
+            + "B" + Math.min(sc.blockCount, 9)
+            + "C" + (sc.mostlyCaps ? "1" : "0");
+}
+
+}
