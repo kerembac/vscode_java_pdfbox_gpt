@@ -165,15 +165,48 @@ private static List<String> groupLinesIntoParagraphs(List<Line> lines, int maxPa
     Kind curKind = null;
     boolean dialogueMode = false;
 
-    // NEW: track max scene score inside current paragraph (only used when curKind==SCENE)
+    // track max scene score inside current paragraph (only used when curKind==SCENE)
     int curSceneScoreMax = 0;
 
-float curParaMinX = -1f; // NEW: indent baseline for current paragraph
+    // indent baseline for current paragraph
+    float curParaMinX = -1f;
 
     float curMinXMin = Float.MAX_VALUE;
     float curFontAvg = 0f;
     int curFontCount = 0;
 
+    // NEW: remember a baseline "action" indent we've seen, to allow safe dialogue→action switch
+    float seenActionMinX = Float.NaN;
+
+    // helper: detect page numbers / footer-ish single tokens (extra grouping only)
+    // examples: "7.", "11.", "8.", "5."
+    final java.util.regex.Pattern PAGE_NO = java.util.regex.Pattern.compile("^\\d{1,3}\\s*[\\.)]$");
+
+    // helper: detect transition-ish parentheticals (extra grouping only)
+    // examples: "(KESME)", "(CUT TO)", "(FADE OUT)"
+    final java.util.regex.Pattern TRANS_PAREN = java.util.regex.Pattern.compile("^\\(\\s*[A-ZÇĞİÖŞÜ ]{3,}\\s*\\)$");
+
+    // helper: detect "corrupt-ish" line (extra grouping only)
+    // long runs without spaces, or many underscores, etc.
+    // (we do NOT change kind; we only change style label)
+    java.util.function.Predicate<String> looksCorrupt = (String txt) -> {
+        if (txt == null) return false;
+        String s = txt.trim();
+        if (s.isEmpty()) return false;
+
+        long underscores = s.chars().filter(ch -> ch == '_').count();
+        if (underscores >= 6) return true;
+
+        // very long token without spaces (after cleanup) tends to be an artifact
+        int maxRun = 0, run = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!Character.isWhitespace(c)) run++;
+            else { maxRun = Math.max(maxRun, run); run = 0; }
+        }
+        maxRun = Math.max(maxRun, run);
+        return maxRun >= 35;
+    };
 
     for (Line ln : lines) {
         String t = normalize(ln.text.toString());
@@ -197,10 +230,23 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
         else if (isParenthetical(t)) lineKind = Kind.PAREN;
         else if (dialogueMode) lineKind = Kind.DIALOGUE;
         else lineKind = Kind.ACTION;
-//Temp debug:
+
+        // --- SAFE dialogue→action escape hatch (does NOT affect character/scene detection) ---
+        // If we're in dialogue mode and we see a line that is "dialogue by mode"
+        // but its indent is close to the action baseline, treat it as ACTION and end dialogue mode.
+        // This helps: dialogue-chain accidentally swallowing action blocks.
+        if (dialogueMode && lineKind == Kind.DIALOGUE && !Float.isNaN(seenActionMinX)) {
+            // If indent is near action indent (or smaller), it's probably action.
+            if (ln.minX <= (seenActionMinX + 15f)) { // tune later
+                lineKind = Kind.ACTION;
+                dialogueMode = false;
+            }
+        }
+
+        // Temp debug:
         if (t.contains("HIRT")) {
-    System.out.println("DBG HIRT t=[" + t + "] isScene=" + isSceneHeading(t)
-        + " isChar=" + isCharacterCue(t));
+            System.out.println("DBG HIRT t=[" + t + "] isScene=" + isSceneHeading(t)
+                    + " isChar=" + isCharacterCue(t));
         }
 
         boolean newPara;
@@ -221,8 +267,8 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
         if (!newPara && curKind != null && curKind != lineKind) {
             newPara = true;
         }
-        // NEW: if we're staying in ACTION/DIALOGUE but indent jumps, split paragraph.
-        // (this is the core test you want)
+
+        // indent jump splits paragraphs for ACTION/DIALOGUE (your existing core test)
         if (!newPara && curKind != null && curKind == lineKind) {
             if (lineKind == Kind.ACTION || lineKind == Kind.DIALOGUE) {
                 if (curParaMinX >= 0 && Math.abs(ln.minX - curParaMinX) >= 35f) { // tune later
@@ -233,15 +279,32 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
 
         if (newPara) {
             if (cur.length() > 0) {
-//                Kind k = (curKind == null ? Kind.ACTION : curKind);
-//                String header = (k == Kind.SCENE)
-//                        ? ("SCENE_S" + curSceneScoreMax)
-//                        : k.toString();
                 Kind k = (curKind == null ? Kind.ACTION : curKind);
                 float paraFont = (curFontCount > 0) ? (curFontAvg / curFontCount) : 0f;
+
+                String bodyTrim = cur.toString().trim();
                 String header = paraHeader(k, curSceneScoreMax, curMinXMin, paraFont);
 
-                paras.add(header + "\n" + cur.toString().trim());
+                // --- EXTRA STYLE GROUPING ONLY (no behavior change) ---
+                // 1) Page numbers: keep kind as-is, but force distinct style label.
+                if (PAGE_NO.matcher(bodyTrim).matches()) {
+                    // Example: ACTION_x110_f12 becomes ACTION_PG_x110_f12
+                    header = k.name() + "_PG_" + "x" + bucket10(curMinXMin) + "_f" + bucketFont(paraFont);
+                }
+
+                // 2) Transition-like parenthetical: group separately
+                if (k == Kind.PAREN && TRANS_PAREN.matcher(bodyTrim).matches()) {
+                    // Example: PAREN_TR_x240_f12
+                    header = "PAREN_TR_" + "x" + bucket10(curMinXMin) + "_f" + bucketFont(paraFont);
+                }
+
+                // 3) Corrupt-ish paragraph: group separately
+                if (looksCorrupt.test(bodyTrim)) {
+                    // Example: ACTION_CORR_x110_f12
+                    header = k.name() + "_CORR_" + "x" + bucket10(curMinXMin) + "_f" + bucketFont(paraFont);
+                }
+
+                paras.add(header + "\n" + bodyTrim);
                 if (paras.size() >= maxParas) break;
                 cur.setLength(0);
             }
@@ -251,10 +314,10 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
             curFontAvg = ln.avgFontSize();
             curFontCount = 1;
 
-            // NEW: reset scene max for the new paragraph
+            // reset scene max for the new paragraph
             curSceneScoreMax = (lineKind == Kind.SCENE) ? sc.score : 0;
 
-            curParaMinX = ln.minX; // NEW
+            curParaMinX = ln.minX;
 
         } else {
             cur.append("\n");
@@ -263,16 +326,20 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
         cur.append(t);
         prev = ln;
 
-
+        // update current para stats
         curMinXMin = Math.min(curMinXMin, ln.minX);
         curFontAvg += ln.avgFontSize();
         curFontCount++;
-        //For latear usage:
-        //float paraFont = (curFontCount > 0) ? (curFontAvg / curFontCount) : 0f;
 
-        // NEW: update max score while building a SCENE paragraph
+        // update max score while building a SCENE paragraph
         if (curKind == Kind.SCENE) {
             curSceneScoreMax = Math.max(curSceneScoreMax, sc.score);
+        }
+
+        // record action baseline (for later dialogue→action switching)
+        if (lineKind == Kind.ACTION) {
+            if (Float.isNaN(seenActionMinX)) seenActionMinX = ln.minX;
+            else seenActionMinX = Math.min(seenActionMinX, ln.minX);
         }
 
         // update mode
@@ -281,16 +348,24 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
     }
 
     if (paras.size() < maxParas && cur.length() > 0) {
-//        Kind k = (curKind == null ? Kind.ACTION : curKind);
-//        String header = (k == Kind.SCENE)
-//                ? ("SCENE_S" + curSceneScoreMax)
-//               : k.toString();
         Kind k = (curKind == null ? Kind.ACTION : curKind);
         float paraFont = (curFontCount > 0) ? (curFontAvg / curFontCount) : 0f;
+
+        String bodyTrim = cur.toString().trim();
         String header = paraHeader(k, curSceneScoreMax, curMinXMin, paraFont);
 
+        // same extra grouping at end
+        if (PAGE_NO.matcher(bodyTrim).matches()) {
+            header = k.name() + "_PG_" + "x" + bucket10(curMinXMin) + "_f" + bucketFont(paraFont);
+        }
+        if (k == Kind.PAREN && TRANS_PAREN.matcher(bodyTrim).matches()) {
+            header = "PAREN_TR_" + "x" + bucket10(curMinXMin) + "_f" + bucketFont(paraFont);
+        }
+        if (looksCorrupt.test(bodyTrim)) {
+            header = k.name() + "_CORR_" + "x" + bucket10(curMinXMin) + "_f" + bucketFont(paraFont);
+        }
 
-        paras.add(header + "\n" + cur.toString().trim());
+        paras.add(header + "\n" + bodyTrim);
     }
 
     return paras;
