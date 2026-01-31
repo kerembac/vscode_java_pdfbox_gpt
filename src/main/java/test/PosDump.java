@@ -1,5 +1,6 @@
 package test;
 
+
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -113,6 +114,10 @@ static class G {
 
             List<Line> lines = buildLines(stripper.glyphs);
             List<String> paras = groupLinesIntoParagraphs(lines, maxParas);
+File out = new File("out.json");
+List<ParaOut> outParas = JsonOut.toParaOut(paras);
+JsonOut.writeParasJson(new File("out.json"), outParas);
+System.out.println("Wrote: " + out.getAbsolutePath());
 
 for (int i = 0; i < paras.size(); i++) {
     String[] parts = paras.get(i).split("\n", 2);
@@ -196,7 +201,7 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
         if (t.contains("HIRT")) {
     System.out.println("DBG HIRT t=[" + t + "] isScene=" + isSceneHeading(t)
         + " isChar=" + isCharacterCue(t));
-}
+        }
 
         boolean newPara;
 
@@ -216,15 +221,15 @@ float curParaMinX = -1f; // NEW: indent baseline for current paragraph
         if (!newPara && curKind != null && curKind != lineKind) {
             newPara = true;
         }
-// NEW: if we're staying in ACTION/DIALOGUE but indent jumps, split paragraph.
-// (this is the core test you want)
-if (!newPara && curKind != null && curKind == lineKind) {
-    if (lineKind == Kind.ACTION || lineKind == Kind.DIALOGUE) {
-        if (curParaMinX >= 0 && Math.abs(ln.minX - curParaMinX) >= 35f) { // tune later
-            newPara = true;
+        // NEW: if we're staying in ACTION/DIALOGUE but indent jumps, split paragraph.
+        // (this is the core test you want)
+        if (!newPara && curKind != null && curKind == lineKind) {
+            if (lineKind == Kind.ACTION || lineKind == Kind.DIALOGUE) {
+                if (curParaMinX >= 0 && Math.abs(ln.minX - curParaMinX) >= 35f) { // tune later
+                    newPara = true;
+                }
+            }
         }
-    }
-}
 
         if (newPara) {
             if (cur.length() > 0) {
